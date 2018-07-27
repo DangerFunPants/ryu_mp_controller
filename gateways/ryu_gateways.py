@@ -186,14 +186,34 @@ class RoutingGatewayController(app_manager.RyuApp):
         if ip_pkt:
             info('Received IP Packet. Src: %s, Dst: %s.' % (ip_pkt.src,
                 ip_pkt.dst))
+        
+        # The changes will need to occur in this branch, since routes
+        # will be statically installed, we can assume that any traffic
+        # that reaches this switch with udp_dst ==
+        # self.TEST_TRAFFIC_PORT must be destined for the locally
+        # connected host
+        # if ip_pkt and udp_pkt and udp_pkt.dst_port == self.TEST_TRAFFIC_DEST_PORT and int(ip_pkt.src.split('.')[-1]) == src_sw.id:
+        #     info('Switch %d received test traffic on port: %d' % (src_sw.id, of_msg.match['in_port']))
+        #     (out_port, dst_sw_dpid) = self.route_test_traffic(src_sw, of_msg, ip_pkt, udp_pkt)
+        #     dst_sw = self.datapaths[dst_sw_dpid]
+        #     of_act = [dst_sw.ofproto_parser.OFPActionOutput(dst_sw.ofproto.OFPP_NORMAL)]
+        #     self.inject_packet(dst_sw, of_msg, of_act)
+        #     return
 
-        if ip_pkt and udp_pkt and udp_pkt.dst_port == self.TEST_TRAFFIC_DEST_PORT and int(ip_pkt.src.split('.')[-1]) == src_sw.id:
-            info('Switch %d received test traffic on port: %d' % (src_sw.id, of_msg.match['in_port']))
-            (out_port, dst_sw_dpid) = self.route_test_traffic(src_sw, of_msg, ip_pkt, udp_pkt)
-            dst_sw = self.datapaths[dst_sw_dpid]
-            of_act = [dst_sw.ofproto_parser.OFPActionOutput(dst_sw.ofproto.OFPP_NORMAL)]
-            self.inject_packet(dst_sw, of_msg, of_act)
-            return
+        # No longer need the condition that checks the last quartet of
+        # the L3 addr since we assume precomputed and installed routes
+        # for test traffic.
+        # if udp_pkt and udp_pkt.dst_port == self.TEST_TRAFFIC_DEST_PORT:
+        #    info('switch %d received test traffic on sw_port: %d' %
+        #            (src_sw.id, of_msg.match['in_port']))
+
+        #    # Craft an ARP request for the dst L3 address of the packet. 
+        #    arp_req = arp.arp(src_mac=src_sw.id, src_ip=ip_pkt.src_ip,
+        #            dst_ip=ip_pkt.dst_ip)
+        #    self.broadcast_frame(src_sw, arp_req)
+
+         
+
 
         self.switch_l2_packet(src_sw, of_msg, eth_frame)
 
