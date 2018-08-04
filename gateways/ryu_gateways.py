@@ -159,6 +159,12 @@ class RoutingGatewayController(app_manager.RyuApp):
             del self.adj_mat[dst_sw.dpid][src_sw.dpid]
         except KeyError:
             pass
+        
+        self.update_link_state(src_sw, dst_sw)
+        host_ports = self.compute_host_ports()
+        mst = self.compute_mst()
+        self.active_ports = self.compute_active_ports(mst, host_ports)
+    
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -186,34 +192,6 @@ class RoutingGatewayController(app_manager.RyuApp):
         if ip_pkt:
             info('Received IP Packet. Src: %s, Dst: %s.' % (ip_pkt.src,
                 ip_pkt.dst))
-        
-        # The changes will need to occur in this branch, since routes
-        # will be statically installed, we can assume that any traffic
-        # that reaches this switch with udp_dst ==
-        # self.TEST_TRAFFIC_PORT must be destined for the locally
-        # connected host
-        # if ip_pkt and udp_pkt and udp_pkt.dst_port == self.TEST_TRAFFIC_DEST_PORT and int(ip_pkt.src.split('.')[-1]) == src_sw.id:
-        #     info('Switch %d received test traffic on port: %d' % (src_sw.id, of_msg.match['in_port']))
-        #     (out_port, dst_sw_dpid) = self.route_test_traffic(src_sw, of_msg, ip_pkt, udp_pkt)
-        #     dst_sw = self.datapaths[dst_sw_dpid]
-        #     of_act = [dst_sw.ofproto_parser.OFPActionOutput(dst_sw.ofproto.OFPP_NORMAL)]
-        #     self.inject_packet(dst_sw, of_msg, of_act)
-        #     return
-
-        # No longer need the condition that checks the last quartet of
-        # the L3 addr since we assume precomputed and installed routes
-        # for test traffic.
-        # if udp_pkt and udp_pkt.dst_port == self.TEST_TRAFFIC_DEST_PORT:
-        #    info('switch %d received test traffic on sw_port: %d' %
-        #            (src_sw.id, of_msg.match['in_port']))
-
-        #    # Craft an ARP request for the dst L3 address of the packet. 
-        #    arp_req = arp.arp(src_mac=src_sw.id, src_ip=ip_pkt.src_ip,
-        #            dst_ip=ip_pkt.dst_ip)
-        #    self.broadcast_frame(src_sw, arp_req)
-
-         
-
 
         self.switch_l2_packet(src_sw, of_msg, eth_frame)
 
@@ -281,7 +259,10 @@ class RoutingGatewayController(app_manager.RyuApp):
 
     def broadcast_frame(self, sw, of_msg):
         parser = sw.ofproto_parser
-        port_list = self.active_ports[sw.id]
+        try: 
+            port_list = self.active_ports[sw.id]
+        except KeyError:
+            return
         in_port = of_msg.match['in_port']
         ofp_act_list = [
             parser.OFPActionOutput(port_no) 
@@ -312,6 +293,7 @@ class RoutingGatewayController(app_manager.RyuApp):
         for n1, n2 in link_set:
             if find(n1) is not find(n2):
                 mst.append((n1, n2))
+                mst.append((n2, n1))
                 union(n1, n2)
         pretty_mst = [(n1.id, n2.id) for (n1, n2) in mst]
         return pretty_mst
@@ -335,3 +317,14 @@ class RoutingGatewayController(app_manager.RyuApp):
                                              idle_timeout=idle_timeout,
                                              table_id=100)
         switch.send_msg(flow_mod)
+
+    def remove_all_flows(self, switch):
+        info('Removing all flows from switch with dpid: %s' switch.id)
+        of_proto = switch.ofproto
+        ofp_parser = switch.ofproto_parser
+        instrs = [ofp_parser.OFPInstructionActions(of_proto.OFPIT_APPLY_ACTIONS, 
+            actions)]
+        flow_mod = ofp_parser.OFPFlowMod(datapath=switch, table_id=100, 
+            command=of_proto.OFPFC_DELETE)
+        switch.send_msg(flow_mod)
+
