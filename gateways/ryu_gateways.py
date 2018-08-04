@@ -319,7 +319,7 @@ class RoutingGatewayController(app_manager.RyuApp):
         switch.send_msg(flow_mod)
 
     def remove_all_flows(self, switch):
-        info('Removing all flows from switch with dpid: %s' switch.id)
+        info('Removing all flows from switch with dpid: %s' % switch.id)
         of_proto = switch.ofproto
         ofp_parser = switch.ofproto_parser
         instrs = [ofp_parser.OFPInstructionActions(of_proto.OFPIT_APPLY_ACTIONS, 
