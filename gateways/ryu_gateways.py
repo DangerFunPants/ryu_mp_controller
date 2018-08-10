@@ -18,17 +18,19 @@ from ryu.lib import mac, ip
 from ryu.topology.api import get_switch, get_link
 from ryu.app.wsgi import ControllerBase
 from ryu.topology import event
-
 # Python std_lib imports
 from collections import defaultdict
-from logging import info, debug, exception
+from logging import info, debug, exception, error
 from time import sleep
 
 # Local Imports
 from union_find import find, make_set, union
 from helpers import show_dpid
 import file_parsing as fp
-import config as cfg
+import host_mapper as hm
+import params as cfg
+
+import pprint as pp
 
 class RoutingGatewayController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -80,6 +82,9 @@ class RoutingGatewayController(app_manager.RyuApp):
 
         # CONTROLLER_SW_PORT :: Int
         self.CONTROLLER_SW_PORT = 4294967294
+        
+        # sw_anmes :: int -> str
+        self.sw_names = {}
 
     # The set_ev_cls decorator takes two parameters, the event type to register
     # for and the connection state that the channel must be in for the event 
@@ -87,6 +92,12 @@ class RoutingGatewayController(app_manager.RyuApp):
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
         dp = ev.switch.dp
+
+        mapper = hm.HostMapper([cfg.dns_server_ip], cfg.of_controller_ip, cfg.of_controller_port)
+        sw_name = mapper.map_dpid_to_sw(dp.id)
+        print(sw_name)
+        self.sw_names[dp.id] = sw_name
+
         info('Discovered switch with DPID: %s' % dp.id)
         if dp.id not in self.datapaths.iterkeys():
             self.datapaths[dp.id] = dp
@@ -105,7 +116,7 @@ class RoutingGatewayController(app_manager.RyuApp):
     @set_ev_cls(event.EventSwitchLeave, MAIN_DISPATCHER)
     def switch_leave_handler(self, ev):
         dp = ev.switch.dp
-        info('Switch with DPID: %s has left the network.' % dp.id)
+        info('Switch with DPID: %s has left the network.' % self.sw_names[dp.id])
         try: 
             del self.datapaths[dp.id]
         except KeyError:
@@ -121,7 +132,10 @@ class RoutingGatewayController(app_manager.RyuApp):
         mst = self.compute_mst()
         self.active_ports = self.compute_active_ports(mst, host_ports)
         info('Active ports: ')
-        info(self.active_ports)
+        info(pp.pformat(self.active_ports))
+        for dpid, sw in self.datapaths.items():
+            self.remove_all_flows(sw, 100)
+            self.install_default_flowmod(sw)
 
     def update_link_state(self, src_sw, dst_sw):
         self.adj_mat[src_sw.dpid][dst_sw.dpid] = src_sw.port_no
@@ -129,6 +143,7 @@ class RoutingGatewayController(app_manager.RyuApp):
         self.link_list.append((src_sw.dpid, dst_sw.dpid))
         self.link_ports[src_sw.dpid].append(src_sw.port_no)
         self.link_ports[dst_sw.dpid].append(dst_sw.port_no)
+        self.mac_to_port.clear()
 
     def compute_host_ports(self):
         available_ports = self.available_ports
@@ -178,7 +193,7 @@ class RoutingGatewayController(app_manager.RyuApp):
         # As a result of Ryu's link detection, all LLDP packets are forwarded
         # to the controller.
         if eth_frame.ethertype == ether_types.ETH_TYPE_LLDP:
-            return 
+            return
 
         # For now, only route ipv4 traffic
         if eth_frame.ethertype == ether_types.ETH_TYPE_IPV6:
@@ -188,12 +203,39 @@ class RoutingGatewayController(app_manager.RyuApp):
 
         ip_pkt = in_pkt.get_protocol(ipv4.ipv4)
         udp_pkt = in_pkt.get_protocol(udp.udp)
+        arp_pkt = in_pkt.get_protocol(arp.arp)
 
+        info('SWITCH DPID: %s' % self.sw_names[src_sw.id])
         if ip_pkt:
-            info('Received IP Packet. Src: %s, Dst: %s.' % (ip_pkt.src,
-                ip_pkt.dst))
+            info('Received IP Packet. Src: %s, Dst: %s, in_port: %d' % (ip_pkt.src,
+                ip_pkt.dst, of_msg.match['in_port']))
+
+        if eth_frame.ethertype == ether_types.ETH_TYPE_ARP:
+            if arp_pkt.opcode == 1:
+                info('Received arp request for ip %s from %s' % (arp_pkt.dst_ip, arp_pkt.src_ip))
+            elif arp_pkt.opcode == 2:
+                info('Received arp reply from %s for %s' % (arp_pkt.src_ip, arp_pkt.dst_ip))
+        
+        if udp_pkt and udp_pkt.dst_port == self.TEST_TRAFFIC_DEST_PORT:
+            # self.bcast_to_hosts(src_sw, of_msg)
+            # Build ARP since we might not have a route? 
+            # arp_pkt = arp.arp( src_ip=ip_pkt.src_ip
+            #                  , dst_ip=ip_pkt.dst_ip 
+            #                  , src_mac = '')
+            self.switch_l2_packet(src_sw, of_msg, eth_frame, False)
+            return 
 
         self.switch_l2_packet(src_sw, of_msg, eth_frame)
+
+    def bcast_to_hosts(self, src_sw, of_msg):
+        host_ports = self.compute_host_ports()
+        hp = host_ports[src_sw.id]
+        parser = src_sw.ofproto_parser
+        ofp_act_list = [
+            parser.OFPActionOutput(port_no)
+            for port_no in hp
+        ]
+        self.inject_packet(src_sw, of_msg, ofp_act_list)
 
     def route_test_traffic(self, src_sw, of_msg, ip_pkt, udp_pkt):
         dst_ip = ip_pkt.dst
@@ -223,7 +265,6 @@ class RoutingGatewayController(app_manager.RyuApp):
         else:
             next_hop = shortest_paths[ds_val - 1][1]
         return (self.adj_mat[src_sw.id][next_hop], dst_dpid)
-
     def k_shortest_paths(self, src_dpid, dst_dpid, k):
         paths = []
         count = defaultdict(int)
@@ -242,16 +283,24 @@ class RoutingGatewayController(app_manager.RyuApp):
                         h.append((p_v, cost + 1))
         return paths
         
-    def switch_l2_packet(self, src_sw, of_msg, eth_frame):
+    def switch_l2_packet(self, src_sw, of_msg, eth_frame, update=True):
         in_port = of_msg.match['in_port']
-        self.mac_to_port[src_sw.id][eth_frame.src] = in_port
+        info(pp.pformat(self.active_ports))
+        info(pp.pformat(self.mac_to_port))
+        if in_port not in self.active_ports[src_sw.id] or not update:
+            error('***********************************************************') 
+            error('Received switched traffic on a port not in the MST')
+            error('Switch: %s, Port: %s' % (self.sw_names[src_sw.id], in_port))
+            error('***********************************************************')
+        else: 
+            self.mac_to_port[src_sw.id][eth_frame.src] = in_port
+
         if eth_frame.dst not in self.mac_to_port[src_sw.id].iterkeys():
             self.broadcast_frame(src_sw, of_msg)
         else:
             ofp_parser = src_sw.ofproto_parser
             of_act_list = [ofp_parser.OFPActionOutput(self.mac_to_port[src_sw.id][eth_frame.dst])]
             of_match = ofp_parser.OFPMatch(
-                eth_src=eth_frame.src,
                 eth_dst=eth_frame.dst
             )
             self.inject_packet(src_sw, of_msg, of_act_list)
@@ -299,7 +348,8 @@ class RoutingGatewayController(app_manager.RyuApp):
         return pretty_mst
 
     def install_flow(self, switch, match, actions=[], priority=1, buffer_id=None, idle_timeout=0):
-        info('Adding flow to switch with DPID: %s' % switch.id)
+        info('Added flow: %s to switch with DPID: %s' % (str(match) + str(actions), self.sw_names[switch.id]))
+        
         of_proto = switch.ofproto
         ofp_parser = switch.ofproto_parser
 
@@ -318,13 +368,17 @@ class RoutingGatewayController(app_manager.RyuApp):
                                              table_id=100)
         switch.send_msg(flow_mod)
 
-    def remove_all_flows(self, switch):
-        info('Removing all flows from switch with dpid: %s' % switch.id)
+    def remove_all_flows(self, switch, table_id=100):
+        info('Removing all flows from switch with sw_name: %s' % self.sw_names[switch.id])
         of_proto = switch.ofproto
         ofp_parser = switch.ofproto_parser
-        instrs = [ofp_parser.OFPInstructionActions(of_proto.OFPIT_APPLY_ACTIONS, 
-            actions)]
-        flow_mod = ofp_parser.OFPFlowMod(datapath=switch, table_id=100, 
-            command=of_proto.OFPFC_DELETE)
+        flow_mod = ofp_parser.OFPFlowMod( datapath=switch
+                                        , table_id=table_id
+                                        , command=of_proto.OFPFC_DELETE
+                                        , match=ofp_parser.OFPMatch()
+                                        , priority=0
+                                        , out_port=of_proto.OFPP_ANY
+                                        , out_group=of_proto.OFPG_ANY
+                                        )
         switch.send_msg(flow_mod)
 
