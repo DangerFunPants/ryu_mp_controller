@@ -26,7 +26,6 @@ from time import sleep
 # Local Imports
 from union_find import find, make_set, union
 from helpers import show_dpid
-import file_parsing as fp
 import host_mapper as hm
 import params as cfg
 
@@ -104,6 +103,7 @@ class RoutingGatewayController(app_manager.RyuApp):
         self.available_ports[dp.id] = map(lambda of_port : of_port.port_no, dp.ports.values())
         predicate = lambda p_num : not p_num == self.CONTROLLER_SW_PORT
         self.available_ports[dp.id] = filter(predicate, self.available_ports[dp.id])
+        self.remove_all_flows(dp, 100)
         self.install_default_flowmod(dp)
 
     def install_default_flowmod(self, sw):
@@ -119,8 +119,29 @@ class RoutingGatewayController(app_manager.RyuApp):
         info('Switch with DPID: %s has left the network.' % self.sw_names[dp.id])
         try: 
             del self.datapaths[dp.id]
+            del self.link_ports[dp.id]
         except KeyError:
-            pass
+            error("Failed to delete key")
+        for dst_sw, port_no in self.adj_mat[dp.id].items():
+            self.link_ports[dst_sw] = [ p for p in self.link_ports[dst_sw] if p != port_no ]
+
+        self.adj_mat = { src_dp : 
+                        { dst_dp : p for dst_dp, p in v.items() if dst_dp != dp } 
+                         for src_dp, v in self.adj_mat.items() 
+                         if src_dp != dp
+                       }
+        print('size before %d' % len(self.link_list))
+        self.link_list = [ (u, v) for (u, v) in 
+                           self.link_list if u != dp.id and v != dp.id ]
+        print('size after: %d' % len(self.link_list))
+        self.mac_to_port.clear()
+        host_ports = self.compute_host_ports()
+        mst = self.compute_mst()
+        self.active_ports = self.compute_active_ports(mst, host_ports)
+        for dpid, sw in self.datapaths.items():
+            self.remove_all_flows(sw, 100)
+            self.install_default_flowmod(sw)
+        
 
     @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
     def link_add_handler(self, ev):
@@ -175,7 +196,6 @@ class RoutingGatewayController(app_manager.RyuApp):
         except KeyError:
             pass
         
-        self.update_link_state(src_sw, dst_sw)
         host_ports = self.compute_host_ports()
         mst = self.compute_mst()
         self.active_ports = self.compute_active_ports(mst, host_ports)
@@ -217,11 +237,6 @@ class RoutingGatewayController(app_manager.RyuApp):
                 info('Received arp reply from %s for %s' % (arp_pkt.src_ip, arp_pkt.dst_ip))
         
         if udp_pkt and udp_pkt.dst_port == self.TEST_TRAFFIC_DEST_PORT:
-            # self.bcast_to_hosts(src_sw, of_msg)
-            # Build ARP since we might not have a route? 
-            # arp_pkt = arp.arp( src_ip=ip_pkt.src_ip
-            #                  , dst_ip=ip_pkt.dst_ip 
-            #                  , src_mac = '')
             self.switch_l2_packet(src_sw, of_msg, eth_frame, False)
             return 
 
@@ -332,13 +347,17 @@ class RoutingGatewayController(app_manager.RyuApp):
         sw.send_msg(inject_pkt)
 
     def compute_mst(self):
-        node_set = [make_set(i) for i in self.datapaths.iterkeys()]
+        # node_set = [make_set(i) for i in self.datapaths.iterkeys()]
+        # mst = []
+        # match_node = lambda ln : next(n for n in node_set if n.id == ln)
+
+        # link_set = [
+        #     (match_node(ln1), match_node(ln2))
+        #     for (ln1, ln2) in self.link_list
+        # ]
         mst = []
-        match_node = lambda ln : next(n for n in node_set if n.id == ln)
-        link_set = [
-            (match_node(ln1), match_node(ln2))
-            for (ln1, ln2) in self.link_list
-        ]
+        node_set = { i : make_set(i) for i in self.datapaths.keys() }
+        link_set = [ (node_set[u], node_set[v]) for (u, v) in self.link_list ]
         for n1, n2 in link_set:
             if find(n1) is not find(n2):
                 mst.append((n1, n2))
